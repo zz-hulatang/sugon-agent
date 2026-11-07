@@ -42,6 +42,46 @@ PyCharm 的 Python 运行配置使用模块名 `streamlit`，参数为 `run apps
 
 浏览器在 **Streamlit 所在电脑** 上打开。本实现面向本机使用，不适合直接部署为远程多用户服务；普通网页链接无法读取另一个浏览器的 HttpOnly Cookie。
 
+## Docker 构建与运行
+
+需要 Docker Engine / Docker Desktop 和 Docker Compose v2。镜像包含 Python、项目依赖、Playwright Chromium 及虚拟桌面，支持在容器中完成原有的可见浏览器登录。浏览器与系统依赖在构建时安装，方式参见 [Playwright 官方文档](https://playwright.dev/python/docs/docker)。构建需要访问 Python、Debian 和 Playwright 下载源；运行时需要能够从容器访问 OA、模型接口和 MySQL。
+
+先按下节创建数据库，并准备项目根目录的 `.env`；已有配置可以复用：
+
+```bash
+cp -n .env.example .env
+# 已安装本机依赖时，可追加默认数据库配置并生成加密密钥：
+python scripts/configure_mysql.py
+docker compose up -d --build
+docker compose ps
+```
+
+没有本机 Python 环境时，也可以先执行 `docker compose build`，再用镜像生成密钥，将输出填入 `.env` 的 `SESSION_ENCRYPTION_KEY`（只生成一次并妥善保存）：
+
+```bash
+docker run --rm --entrypoint python sugon-oa-agent:local -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+```
+
+- 应用：[http://localhost:8501](http://localhost:8501)。
+- 登录桌面：[http://localhost:6080/vnc.html?autoconnect=true&resize=scale](http://localhost:6080/vnc.html?autoconnect=true&resize=scale)。先在应用中点击“打开 OA 登录”，再到桌面中填写账号、扫码或输入验证码；已配置账号密码时仍可在此完成二次验证。
+- 查看日志：`docker compose logs -f app`；停止并移除容器：`docker compose down`。数据库中的会话仍保留，重新启动时继续使用原来的加密密钥。
+
+Compose 默认连接宿主机 MySQL（`host.docker.internal`），会覆盖 `.env` 中的 `MYSQL_HOST=localhost`。数据库需监听容器可访问的地址，并允许应用账号从容器网络连接。连接其他服务器或同网络数据库服务时，在 `.env` 增加 `DOCKER_MYSQL_HOST=实际主机名或IP`；数据库端口仍由 `MYSQL_PORT` 控制。MySQL 由现有服务提供，Compose 不自动创建数据库。使用 `MYSQL_SSL_CA` 时，需通过 Compose 的只读 volume 挂载 CA 文件，并将该变量设置为容器内路径。
+
+`.env` 仅在启动时注入环境变量，不复制进镜像；镜像以普通用户运行。Compose 固定使用镜像自带的 Chromium，不使用宿主机的 Chrome 或 `.env` 中的浏览器安装路径。修改 `.env` 后执行 `docker compose up -d --force-recreate`。
+
+应用和桌面端口默认只绑定宿主机 `127.0.0.1`。桌面没有单独的登录密码，会显示该容器内的全部浏览器窗口；此配置供单用户本机使用，请勿直接向公网开放或共用给多个用户。容器浏览器不会在宿主机弹窗，应通过上述桌面入口操作。
+
+如需只构建镜像：
+
+```bash
+docker build -t sugon-oa-agent:local .
+```
+
+基础镜像默认使用 [Docker 官方在 Amazon ECR 发布的 Python 镜像](https://gallery.ecr.aws/docker/library/python)，以避开 Docker Hub 连接超时。若构建在 `load metadata` / `failed to authorize` 阶段超时，可先运行 `docker pull public.ecr.aws/docker/library/python:3.12-slim-bookworm` 检查镜像仓库连通性。需要改回 Docker Hub 或使用内部仓库时，在 `.env` 设置 `DOCKER_PYTHON_IMAGE=python:3.12-slim-bookworm`（或内部镜像地址）；直接构建则使用 `docker build --build-arg PYTHON_IMAGE=python:3.12-slim-bookworm -t sugon-oa-agent:local .`。
+
+直接使用 `docker run` 时需传入 `.env`、设置 `--shm-size=1g`、发布两个本机端口，并覆盖 `PLAYWRIGHT_BROWSERS_PATH=/opt/playwright`、`OA_BROWSER_CHANNEL=` 和 `MYSQL_HOST`；推荐使用已包含这些设置的 Compose 配置。
+
 ## MySQL 数据源和任务自动恢复
 
 默认主机为 `localhost:3306`，数据库名为 `oa_agent`。先使用现有 MySQL 管理账号创建数据库：

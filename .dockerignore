@@ -1,0 +1,18 @@
+# 仅将镜像所需代码加入构建上下文，排除凭据、虚拟环境和会话数据。
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!README.md
+!main.py
+!src/
+!src/**
+!apps/
+!apps/**
+!docker/
+!docker/**
+**/__pycache__/
+**/*.pyc
+**/.env*
+**/*storage_state*.json
+**/.auth/

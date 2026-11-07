@@ -1,0 +1,21 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${DOCKER_PYTHON_IMAGE:-public.ecr.aws/docker/library/python:3.12-slim-bookworm}
+    image: sugon-oa-agent:local
+    init: true
+    shm_size: "1gb"
+    env_file:
+      - .env
+    environment:
+      # 覆盖本机 .env 中的浏览器路径和数据库 localhost。
+      PLAYWRIGHT_BROWSERS_PATH: /opt/playwright
+      OA_BROWSER_CHANNEL: ""
+      MYSQL_HOST: ${DOCKER_MYSQL_HOST:-host.docker.internal}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8501:8501"
+      - "127.0.0.1:6080:6080"

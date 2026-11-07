@@ -1,0 +1,13 @@
+{
+  "id": "00000001",
+  "pernr": "00000001",
+  "uname": "demo.user",
+  "ename": "测试员工",
+  "name2": "测试员工",
+  "rzdat": "2024-01-01",
+  "zzgsyx": "demo.user@example.invalid",
+  "stext4": "示例公司--示例部门",
+  "pstex": "示例岗位",
+  "zbankn": "0000",
+  "extra_field": {"source": "fixture"}
+}

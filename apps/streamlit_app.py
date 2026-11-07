@@ -1,0 +1,114 @@
+"""Streamlit 界面入口：展示聊天和登录状态，业务操作交给工具与会话层。
+
+启动：python -m streamlit run apps/streamlit_app.py
+"""
+from pathlib import Path
+
+import streamlit as st
+
+from oa_agent.agents.oa_agent import build_agent
+from oa_agent.config import load_settings
+from oa_agent.sessions.session import LoginSession
+from oa_agent.sessions.tasks import ChatTaskRunner
+from oa_agent.tools.login import make_login_tool
+from oa_agent.tools.employee import make_employee_tool
+
+# 按脚本位置定位项目 .env，兼容从 PyCharm 或其他工作目录启动。
+settings = load_settings(Path(__file__).resolve().parents[1] / ".env")
+st.set_page_config(page_title="OA 智能助手", page_icon="🏢")
+st.title("OA 智能助手")
+st.caption("在本机浏览器中登录 OA，再通过对话使用工具。")
+if "oa_session" not in st.session_state:
+    # Streamlit 每次交互都会重跑脚本，用 session_state 保留当前用户的浏览器线程。
+    st.session_state.oa_session = LoginSession(settings.login, settings.database)
+if "chat_tasks" not in st.session_state:
+    st.session_state.chat_tasks = ChatTaskRunner()
+chat_tasks = st.session_state.chat_tasks
+session = st.session_state.oa_session
+login_tool = make_login_tool(session)
+employee_tool = make_employee_tool(session)
+
+
+def run_login_action(action):
+    """将登录操作的结果转成界面通知，后台认证不依赖该通知是否被展示。"""
+    try:
+        result = action()
+        kind = "error" if result["state"] == "error" else (
+            "success" if result["state"] == "verified" else "info"
+        )
+        st.session_state.login_notice = (kind, result["message"])
+    except Exception:
+        # 浏览器异常可能包含带凭据的 SSO 地址，界面只显示固定提示。
+        st.session_state.login_notice = (
+            "error", "操作未完成，请检查 OA 网络、Chromium 安装及登录检测配置。"
+        )
+
+
+@st.fragment(run_every=1)
+def render_login_panel():
+    """每秒独立刷新侧栏；实际登录检测在后台线程进行，不重跑整段聊天流程。"""
+    st.subheader("OA 会话")
+    st.write("地址：https://soa.com.cn/")
+    st.caption("浏览器会在运行 Streamlit 的电脑上打开。")
+    if not settings.database.configured:
+        st.info("请在本机 .env 配置 MYSQL_USER、MYSQL_PASSWORD 和 SESSION_ENCRYPTION_KEY。")
+    if st.button("打开 OA 登录", use_container_width=True):
+        run_login_action(lambda: login_tool.invoke({"action": "open"}))
+    if st.button("关闭会话并清除凭据", use_container_width=True):
+        run_login_action(lambda: session.call("clear"))
+    if "login_notice" in st.session_state:
+        kind, message = st.session_state.login_notice
+        getattr(st, kind)(message)
+    try:
+        # 这里只读取状态和数量；凭据原文保留在会话层，不写入页面或对话。
+        status = session.call("status")
+        st.write(f"状态：{status['state']}")
+        st.write(f"Cookie：{status['cookie_count']} 项；Token：{status['token_count']} 项")
+        if status.get("persistence_error"):
+            st.error(status["message"])
+        elif status.get("recovering"):
+            st.info("正在恢复登录，完成浏览器验证后会自动继续当前任务。")
+        elif status["state"] == "verified":
+            st.success("登录成功，已自动采集会话。")
+        elif status["state"] == "waiting_login":
+            auto_messages = {
+                "waiting_form": "已启用自动登录，正在等待登录表单就绪。",
+                "submitted": "已自动提交账号密码，正在等待登录结果。",
+                "needs_verification": "需要二次验证，请在浏览器中完成，随后自动采集会话。",
+                "failed": "自动登录未完成，已停止自动重试。请在浏览器检查，或关闭会话后重试。",
+            }
+            st.info(auto_messages.get(status.get("auto_login"), "等待浏览器登录，成功后自动采集会话。"))
+        if status["state"] == "verified" and not status["token_count"]:
+            st.info("未发现独立 Token。OA 可能只使用 Cookie，或需配置实际 Token 字段。")
+    except Exception:
+        st.info("会话不可用，请重新打开登录。")
+
+
+with st.sidebar:
+    render_login_panel()
+
+@st.fragment(run_every=1)
+def render_conversation():
+    # 页面重跑只读取进度；原 Agent 调用和业务任务保留在后台执行。
+    chat_tasks.poll()
+    for message in chat_tasks.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+    if chat_tasks.busy:
+        st.info("正在执行当前任务；若浏览器需要验证码，请完成验证，系统会自动继续，无需再次输入任务。")
+    prompt = st.chat_input("例如：打开 OA，或获取我的用户信息", disabled=chat_tasks.busy)
+    if prompt:
+        if not settings.model.configured:
+            st.info("请先在 .env 配置 OPENAI_API_KEY 和 OPENAI_MODEL；侧栏登录功能无需模型即可使用。")
+            return
+
+        def respond(history):
+            result = build_agent([login_tool, employee_tool], settings.model).invoke(
+                {"messages": history}, config={"recursion_limit": 10})
+            return result["messages"][-1].text
+
+        chat_tasks.submit(prompt, respond)
+        st.rerun()
+
+
+render_conversation()

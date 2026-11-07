@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sugon-oa-agent"
+version = "0.1.0"
+description = "Streamlit and LangChain OA assistant with automatic session capture"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.40,<2",
+    "langchain>=1.0,<2",
+    "langchain-openai>=1.0,<2",
+    "playwright>=1.49,<2",
+    "python-dotenv>=1.0,<2",
+    "pymysql>=1.1,<2",
+    "cryptography>=43,<48",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

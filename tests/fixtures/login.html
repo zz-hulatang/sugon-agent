@@ -1,0 +1,8 @@
+<!doctype html><input type="password" id="password"><script>
+setTimeout(() => {
+document.cookie = 'DP_Token=smoke%2Ftoken; path=/; Secure';
+localStorage.setItem('auth', JSON.stringify({access_token:'local-smoke-token'}));
+document.querySelector('#password').remove();
+fetch('https://msp.soa.com.cn/api/sap/getLoginUser', {headers: {Token:'smoke/token'}});
+}, 1500);
+</script>

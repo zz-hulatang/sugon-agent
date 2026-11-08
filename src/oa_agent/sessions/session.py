@@ -10,11 +10,13 @@ from concurrent.futures import Future
 
 from oa_agent.clients.browser import BrowserClient
 from oa_agent.clients.oa_client import OaClient
+from oa_agent.clients.attendance_client import AttendanceClient
 from oa_agent.config import LoginConfig, MySQLConfig
 from oa_agent.schemas.auth import Credentials
 from oa_agent.services.auth import AuthService
 from oa_agent.services.auto_login import AutoLoginService
 from oa_agent.services.employee import EmployeeService
+from oa_agent.services.attendance import AttendanceService
 from oa_agent.services.authenticated_request import AuthenticatedRequestService, LoginRecoveryError
 from oa_agent.sessions.mysql_repository import MySQLSessionRepository
 from oa_agent.sessions.repository import SessionRepository, SessionRepositoryError
@@ -35,6 +37,7 @@ class LoginSession:
         self.requests = AuthenticatedRequestService(config.username.strip(), self.repository, self._renew_login,
                                                     self._invalidate, self._restore_snapshot)
         self.employee = EmployeeService(config, OaClient(self.browser), self.requests)
+        self.attendance = AttendanceService(config, AttendanceClient(self.browser), self.requests)
         self._published_fingerprint = None
         self._published_revision = None
         self._recovering = False
@@ -56,16 +59,19 @@ class LoginSession:
                 self._thread = threading.Thread(target=self._worker, daemon=True)
                 self._thread.start()
 
-    def call(self, action: str):
+    def call(self, action: str, payload: dict | None = None):
         """通过队列调用浏览器线程；credentials 仅供可信 Python 后端使用。"""
-        if action not in {"open", "collect", "status", "clear", "credentials", "user_info"}:
+        business_actions = {"user_info", "attendance_query", "attendance_submit"}
+        if action not in {"open", "collect", "status", "clear", "credentials", *business_actions}:
             raise ValueError("不支持的会话操作")
+        if payload is not None and (not isinstance(payload, dict) or action not in {"attendance_query", "attendance_submit"}):
+            raise ValueError("不支持的会话参数")
         self._start()
         # 调用者等待 Future，浏览器操作始终在同一线程执行，保持 Playwright 线程约束。
         future: Future = Future()
-        self._commands.put((action, future))
+        self._commands.put((action, future, deepcopy(payload or {})))
         # 业务请求自身有 HTTP/数据库超时和登录等待上限，不在调用端提前丢弃仍等待验证的任务。
-        return future.result(timeout=None if action == "user_info" else 55)
+        return future.result(timeout=None if action in business_actions else 55)
 
     def credentials(self) -> Credentials:
         """返回凭据副本给后端业务代码；不得作为 LangChain 工具暴露给模型。"""
@@ -77,7 +83,7 @@ class LoginSession:
             if not self._thread or not self._thread.is_alive():
                 return
             future: Future = Future()
-            self._commands.put(("stop", future))
+            self._commands.put(("stop", future, {}))
         try:
             future.result(timeout=5)
             self._thread.join(timeout=1)
@@ -111,7 +117,7 @@ class LoginSession:
                         # 登录跳转可能销毁正在读取的 frame，清空旧快照并在下次重试。
                         self.store.reset("waiting_login")
             try:
-                action, future = self._commands.get(timeout=0.1)
+                action, future, payload = self._commands.get(timeout=0.1)
             except queue.Empty:
                 # 队列等待超时后继续分发浏览器事件；自动采集不依赖 UI 发出命令。
                 if self.browser.context:
@@ -127,6 +133,7 @@ class LoginSession:
                     self._clear()
                     self.store.state = "expired"
                 if action == "stop":
+                    self.attendance.clear()
                     self._clear()
                     future.set_result(None)
                     return
@@ -147,6 +154,7 @@ class LoginSession:
                     if self.store.state == "verified":
                         self._publish()
                 elif action == "clear":
+                    self.attendance.clear()
                     username = self.config.username.strip() or self.auth.authenticated_username
                     try:
                         if username:
@@ -160,6 +168,10 @@ class LoginSession:
                 elif action == "user_info":
                     # HTTP 调用同样在浏览器所属线程执行，避免跨线程使用 Playwright。
                     result = self.employee.get_current_user()
+                elif action == "attendance_query":
+                    result = self.attendance.query(**payload)
+                elif action == "attendance_submit":
+                    result = self.attendance.submit(**payload)
                 else:
                     messages = {
                         "verified": "已自动采集登录会话。",
@@ -234,7 +246,7 @@ class LoginSession:
                 # Future 对应的原业务任务一直保留，成功后由执行器继续该请求。
                 for _ in range(100):
                     try:
-                        action, future = self._commands.get_nowait()
+                        action, future, payload = self._commands.get_nowait()
                     except queue.Empty:
                         break
                     if action == "status":
@@ -242,6 +254,7 @@ class LoginSession:
                     elif action == "credentials":
                         future.set_result(self.store.snapshot())
                     elif action in {"clear", "stop"}:
+                        self.attendance.clear()
                         self._stopping = action == "stop"
                         try:
                             if action == "clear" and self.config.username.strip():
@@ -256,7 +269,7 @@ class LoginSession:
                     elif action == "open":
                         future.set_result(self._status("正在等待登录完成，无需重复发起任务。"))
                     else:
-                        self._deferred.append((action, future))
+                        self._deferred.append((action, future, payload))
                 if not self.browser.pump_events():
                     raise LoginRecoveryError("登录窗口已关闭")
             raise LoginRecoveryError("登录等待超时")

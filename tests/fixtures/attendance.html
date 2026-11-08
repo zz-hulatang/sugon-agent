@@ -1,0 +1,50 @@
+<!doctype html><meta charset="utf-8"><title>模拟异常考勤</title>
+<script>
+// 独立测试替身，所有人员、记录、编号均为虚构；不复制生产业务规则。
+window.scenario = "success";
+window.Vue = {nextTick: () => Promise.resolve()};
+window.AnnualleaveConfig = [];
+window.form_data = {setfile: {DOCID: "fake-document", formid: "abnormalattendapp"},
+    basicinfo: {apppsnid: "demo.user", SerialNumber: "TEST-ONLY-1"}, info: {}};
+let rows = [{rq: "old-month-row", rowid: "old-row"}];
+let rowNumber = 0;
+const table = {
+    list_title: [{name: "备注", code: "memo"}], list_data_all: [], selectData: [],
+    async reloadTable() { this.list_data_all = JSON.parse(JSON.stringify(rows)); },
+    del() { rows = rows.filter(row => !this.selectData.some(selected => selected.rowid === row.rowid)); },
+    change() {
+        const source = this.selectData[0];
+        const element = document.createElement("div"); document.body.append(element);
+        window.tableopenvw = {
+            listdata: {...source}, titledata: [], $el: element,
+            $set(object, key, value) { object[key] = value; },
+            confirm() {
+                rows = rows.map(row => row.rowid === source.rowid ? {...this.listdata} : row);
+                this.$el.remove();
+            }
+        };
+    }
+};
+window.control = {info_v: {$refs: {tbl: table}}};
+window.vmAddTableRow = (form, name, doc, value) => {
+    rows.push(...JSON.parse(value).map(row => ({...row, rowid: `fake-row-${++rowNumber}`})));
+    return "1";
+};
+window.ltseleter_custom_callback2 = ([choice]) => {
+    Object.assign(window.listTitle, {dxlb: choice.type, dxlbbm: choice.typecode}); return true;
+};
+window.FlowCtlData = {
+    initialized: 5, nodeThisData: [{NODEID: "flowStart"}], nextflowactionmsg: {}, nextNodeAllMsg: {},
+    async getNodeAction(action) {
+        if (window.scenario === "validation") return false;
+        this.nextflowactionmsg = {actMsg: action, nodeMsg: {nodeId: "leader"}, psnMsg: {psnId: "fake-leader"}};
+        this.nextNodeAllMsg = {linkMsg: window.scenario === "multiple" ? [{}, {}] : [{}]};
+        document.body.insertAdjacentHTML("beforeend", '<div class="flowDig"><button class="flowDig_submit">确定</button></div>');
+    },
+    async setNodeAction() {
+        await fetch("/gateway/attendance/leaveapp/updateLeaveApply/leader", {method: "POST", body: JSON.stringify(rows)});
+        await fetch("/appForm/FormSubmit", {method: "POST", body: "fake-form"});
+        await fetch("/FlowEngine/setNodeMsg?docid=fake-document&flowReqType=getNextNode", {method: "POST", body: "fake-flow"});
+    }
+};
+</script>

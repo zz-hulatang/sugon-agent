@@ -16,10 +16,14 @@ dependencies = [
     "python-dotenv>=1.0,<2",
     "pymysql>=1.1,<2",
     "cryptography>=43,<48",
+    "pydantic>=2.7,<3",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+oa_agent = ["clients/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

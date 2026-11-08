@@ -19,7 +19,7 @@ class AuthenticatedRequestService:
         self.on_loaded = on_loaded or (lambda record: None)
 
     def execute(self, operation: Callable[[SavedSession], dict]) -> dict:
-        """当前仅用于可安全重试的用户信息 GET；一次任务最多恢复登录一次。"""
+        """仅用于可安全重试的只读操作；禁止将保存、提交等写请求传入。"""
         record = self.repository.load(self.username)
         renewed = record is None
         if renewed:

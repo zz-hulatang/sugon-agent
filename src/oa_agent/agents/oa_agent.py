@@ -2,7 +2,7 @@
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
-from oa_agent.agents.prompts import SYSTEM_PROMPT
+from oa_agent.agents.prompts import build_system_prompt
 from oa_agent.config import ModelConfig
 
 
@@ -18,4 +18,4 @@ def build_agent(tools: list, config: ModelConfig):
         max_retries=1,
     )
     # 只注册明确支持的能力；模型通过工具接收业务结果，不直接接触浏览器或凭据仓库。
-    return create_agent(model=model, tools=tools, system_prompt=SYSTEM_PROMPT)
+    return create_agent(model=model, tools=tools, system_prompt=build_system_prompt())

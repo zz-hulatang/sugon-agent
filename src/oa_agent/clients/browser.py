@@ -29,6 +29,20 @@ class BrowserClient:
         finally:
             request.dispose()
 
+    @contextmanager
+    def business_page(self, cookies: list[dict]):
+        """提交表单使用隔离页面，只加载数据库认证，不复用登录页的内存状态。"""
+        self._ensure_driver()
+        channel = self.config.browser_channel or (
+            "" if Path(self._playwright.chromium.executable_path).is_file() else "chrome")
+        browser = self._playwright.chromium.launch(headless=True, timeout=15000, channel=channel or None)
+        try:
+            context = browser.new_context(storage_state={"cookies": cookies, "origins": []})
+            context.set_default_timeout(15000)
+            yield context.new_page()
+        finally:
+            browser.close()
+
     def open(self, on_request, on_response) -> None:
         """打开独立浏览器，并在页面请求发出前注册认证事件回调。"""
         if self.context:

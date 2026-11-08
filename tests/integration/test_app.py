@@ -6,6 +6,20 @@ import unittest
 
 @unittest.skipUnless(importlib.util.find_spec("streamlit") and importlib.util.find_spec("langchain"), "未安装应用依赖")
 class AppTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        from oa_agent.config import AppSettings, LoginConfig, ModelConfig
+        from oa_agent.history.repository import InMemoryHistoryRepository
+
+        # 所有界面测试均隔离本机 .env 和真实数据库。
+        self.history_repository = InMemoryHistoryRepository()
+        settings = patch("oa_agent.config.load_settings", return_value=AppSettings(LoginConfig(), ModelConfig()))
+        repository = patch("oa_agent.history.mysql_repository.MySQLHistoryRepository", return_value=self.history_repository)
+        settings.start()
+        repository.start()
+        self.addCleanup(settings.stop)
+        self.addCleanup(repository.stop)
+
     def test_legacy_main_entry_point(self):
         from streamlit.testing.v1 import AppTest
 
@@ -23,7 +37,8 @@ class AppTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         session = app.session_state["oa_session"]
         self.addCleanup(session.close)
-        self.assertEqual([button.label for button in app.sidebar.button], ["打开 OA 登录", "关闭会话并清除凭据"])
+        self.assertEqual([button.label for button in app.sidebar.button][:3],
+                         ["打开 OA 登录", "关闭会话并清除凭据", "新建会话"])
         app.run(timeout=30)
         self.assertEqual(len(app.exception), 0)
         self.assertIs(app.session_state["oa_session"], session)
@@ -89,6 +104,108 @@ class AppTests(unittest.TestCase):
             self.assertEqual(len(runner.messages), 2)
             self.assertEqual(runner.messages[-1]["content"], "原任务完成")
             agent.invoke.assert_called_once()
+
+    def history_app(self, agent=None):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from streamlit.testing.v1 import AppTest
+        from oa_agent.config import AppSettings, LoginConfig, ModelConfig
+
+        config = AppSettings(LoginConfig(username="alice", password="dummy"),
+                             ModelConfig(api_key="dummy", model="test"))
+        agent = agent if agent is not None else Mock()
+        if agent.invoke.side_effect is None:
+            agent.invoke.side_effect = lambda data, **kwargs: {
+                "messages": [SimpleNamespace(text="回复：" + data["messages"][-1]["content"])]}
+        for patcher in (patch("oa_agent.config.load_settings", return_value=config),
+                        patch("oa_agent.agents.oa_agent.build_agent", return_value=agent)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[2] / "apps" / "streamlit_app.py")).run(timeout=30)
+        self.addCleanup(app.session_state["oa_session"].close)
+        self.assertEqual(len(app.exception), 0)
+        return app, agent
+
+    def complete_chat(self, app):
+        runner = app.session_state["chat_tasks"]
+        if runner._future is not None:
+            runner._future.result(timeout=5)
+        app.run(timeout=30)
+        self.assertEqual(len(app.exception), 0)
+
+    def test_history_new_switch_followup_restart_and_confirmed_delete(self):
+        app, agent = self.history_app()
+        self.assertEqual(self.history_repository.list("alice"), [])
+        app.chat_input[0].set_value("会话 A").run(timeout=30)
+        self.complete_chat(app)
+        first_id = app.session_state["chat_tasks"].history.current_id
+        app.sidebar.button(key="new_conversation").click().run(timeout=30)
+        self.assertEqual(app.session_state["chat_tasks"].messages, [])
+        self.assertEqual(len(self.history_repository.list("alice")), 1)
+        app.chat_input[0].set_value("会话 B").run(timeout=30)
+        self.complete_chat(app)
+        app.sidebar.button(key=f"open_{first_id}").click().run(timeout=30)
+        app.chat_input[0].set_value("继续 A").run(timeout=30)
+        self.complete_chat(app)
+        self.assertEqual([message["content"] for message in agent.invoke.call_args.args[0]["messages"]],
+                         ["会话 A", "回复：会话 A", "继续 A"])
+        restarted, _ = self.history_app()
+        self.assertEqual(restarted.session_state["chat_tasks"].history.current_id, first_id)
+        app.sidebar.button(key=f"delete_{first_id}").click().run(timeout=30)
+        self.assertEqual(len(self.history_repository.list("alice")), 2)
+        app.sidebar.button(key="cancel_delete_history").click().run(timeout=30)
+        self.assertEqual(len(self.history_repository.list("alice")), 2)
+        app.sidebar.button(key=f"delete_{first_id}").click().run(timeout=30)
+        app.sidebar.button(key="confirm_delete_history").click().run(timeout=30)
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(app.session_state["chat_tasks"].messages, [])
+        self.assertEqual(len(self.history_repository.list("alice")), 1)
+        self.assertIn(first_id, self.history_repository.deleted)
+
+    def test_history_switch_during_task_keeps_reply_in_original_and_disables_sending(self):
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        agent = Mock()
+
+        def respond(*args, **kwargs):
+            started.set()
+            release.wait(10)
+            return {"messages": [SimpleNamespace(text="后台完成")]}
+
+        agent.invoke.side_effect = respond
+        app, _ = self.history_app(agent)
+        app.chat_input[0].set_value("执行 A").run(timeout=30)
+        self.assertTrue(started.wait(2))
+        runner = app.session_state["chat_tasks"]
+        first_id = runner.history.current_id
+        self.assertTrue(app.sidebar.button(key=f"delete_{first_id}").disabled)
+        app.sidebar.button(key="new_conversation").click().run(timeout=30)
+        second_id = runner.history.current_id
+        self.assertNotEqual(first_id, second_id)
+        self.assertTrue(app.chat_input[0].disabled)
+        self.assertEqual(runner.messages, [])
+        release.set()
+        self.complete_chat(app)
+        self.assertEqual(runner.history.current_id, second_id)
+        self.assertEqual(runner.messages, [])
+        self.assertFalse(app.chat_input[0].disabled)
+        app.sidebar.button(key=f"open_{first_id}").click().run(timeout=30)
+        self.assertEqual(runner.messages[-1]["content"], "后台完成")
+        self.assertFalse(app.sidebar.button(key=f"delete_{first_id}").disabled)
+        agent.invoke.assert_called_once()
+
+    def test_unfinished_history_warns_without_starting_agent(self):
+        from oa_agent.history.repository import ConversationSummary, HistoryMessage
+
+        self.history_repository.create("alice", ConversationSummary("unfinished", "未完成", 1, 1))
+        self.history_repository.append("alice", "unfinished", [HistoryMessage("prompt", "user", "待处理", 1)])
+        app, agent = self.history_app()
+        self.assertTrue(any("上次任务未完成" in warning.value for warning in app.warning))
+        agent.invoke.assert_not_called()
 
 
 if __name__ == "__main__":

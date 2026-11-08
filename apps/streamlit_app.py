@@ -3,15 +3,20 @@
 启动：python -m streamlit run apps/streamlit_app.py
 """
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
 from oa_agent.agents.oa_agent import build_agent
 from oa_agent.config import load_settings
+from oa_agent.history.manager import ConversationHistory
+from oa_agent.history.mysql_repository import MySQLHistoryRepository
 from oa_agent.sessions.session import LoginSession
 from oa_agent.sessions.tasks import ChatTaskRunner
 from oa_agent.tools.login import make_login_tool
 from oa_agent.tools.employee import make_employee_tool
+from oa_agent.tools.attendance import make_attendance_tools
 
 # 按脚本位置定位项目 .env，兼容从 PyCharm 或其他工作目录启动。
 settings = load_settings(Path(__file__).resolve().parents[1] / ".env")
@@ -22,11 +27,15 @@ if "oa_session" not in st.session_state:
     # Streamlit 每次交互都会重跑脚本，用 session_state 保留当前用户的浏览器线程。
     st.session_state.oa_session = LoginSession(settings.login, settings.database)
 if "chat_tasks" not in st.session_state:
-    st.session_state.chat_tasks = ChatTaskRunner()
+    history = ConversationHistory(settings.login.username, MySQLHistoryRepository(settings.database))
+    history.refresh()
+    st.session_state.chat_tasks = ChatTaskRunner(history)
 chat_tasks = st.session_state.chat_tasks
+history = chat_tasks.history
 session = st.session_state.oa_session
 login_tool = make_login_tool(session)
 employee_tool = make_employee_tool(session)
+attendance_tools = make_attendance_tools(session)
 
 
 def run_login_action(action):
@@ -84,27 +93,81 @@ def render_login_panel():
         st.info("会话不可用，请重新打开登录。")
 
 
+def render_history_panel():
+    view_revision = history.revision
+    st.subheader("历史会话")
+    if st.button("新建会话", key="new_conversation", use_container_width=True):
+        history.new()
+        st.session_state.pop("delete_history_id", None)
+        st.rerun()
+    if history.warning:
+        st.warning(history.warning)
+    if history.persistent and st.button("刷新并重试保存", key="retry_history", use_container_width=True):
+        history.retry(force=True)
+    summaries = history.summaries
+    if not summaries:
+        st.caption("暂无历史会话，发送第一条消息后自动保存。")
+    for summary in summaries:
+        running = chat_tasks.busy and chat_tasks.running_conversation_id == summary.id
+        selected = summary.id == history.current_id
+        title = ("⏳ " if running else "● " if selected else "") + summary.title
+        updated = datetime.fromtimestamp(summary.updated_at, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+        open_column, delete_column = st.columns([5, 1])
+        if open_column.button(title, key=f"open_{summary.id}", help=f"最近更新：{updated}（上海时间）",
+                              use_container_width=True):
+            history.select(summary.id)
+            st.session_state.pop("delete_history_id", None)
+            st.rerun()
+        if delete_column.button("删除", key=f"delete_{summary.id}", disabled=running,
+                                help="任务执行中的会话暂时不能删除"):
+            st.session_state.delete_history_id = summary.id
+    if history.has_more and st.button("加载更多", key="more_history", use_container_width=True):
+        history.load_more()
+        st.rerun()
+    deletion = st.session_state.get("delete_history_id")
+    if deletion:
+        st.warning("确定删除该会话及全部聊天记录？")
+        confirm_column, cancel_column = st.columns(2)
+        if confirm_column.button("确认删除", key="confirm_delete_history",
+                                 disabled=chat_tasks.busy and deletion == chat_tasks.running_conversation_id):
+            if chat_tasks.delete_conversation(deletion):
+                st.session_state.pop("delete_history_id", None)
+                history.refresh()
+            st.rerun()
+        if cancel_column.button("取消", key="cancel_delete_history"):
+            st.session_state.pop("delete_history_id", None)
+            st.rerun()
+    # 使用渲染开始时的版本，避免漏掉渲染过程中后台完成的保存。
+    st.session_state.history_view_revision = view_revision
+
+
 with st.sidebar:
     render_login_panel()
+    render_history_panel()
 
 @st.fragment(run_every=1)
 def render_conversation():
     # 页面重跑只读取进度；原 Agent 调用和业务任务保留在后台执行。
-    chat_tasks.poll()
+    completed = chat_tasks.poll()
+    history.retry()
+    if completed or history.revision != st.session_state.history_view_revision:
+        st.rerun()
     for message in chat_tasks.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     if chat_tasks.busy:
-        st.info("正在执行当前任务；若浏览器需要验证码，请完成验证，系统会自动继续，无需再次输入任务。")
-    prompt = st.chat_input("例如：打开 OA，或获取我的用户信息", disabled=chat_tasks.busy)
+        st.info("后台任务正在执行，可以切换查看或新建会话，完成后可发送新问题。若需要验证码，请在浏览器完成验证。")
+    elif chat_tasks.messages and chat_tasks.messages[-1]["role"] == "user":
+        st.warning("上次任务未完成或结果尚未保存。系统不会自动重复执行；涉及提交时请先在 OA 核实结果。")
+    prompt = st.chat_input("例如：查询我的用户信息，或查询本月异常考勤", disabled=chat_tasks.busy)
     if prompt:
         if not settings.model.configured:
             st.info("请先在 .env 配置 OPENAI_API_KEY 和 OPENAI_MODEL；侧栏登录功能无需模型即可使用。")
             return
 
-        def respond(history):
-            result = build_agent([login_tool, employee_tool], settings.model).invoke(
-                {"messages": history}, config={"recursion_limit": 10})
+        def respond(messages, tools=[login_tool, employee_tool, *attendance_tools], model_config=settings.model):
+            result = build_agent(tools, model_config).invoke(
+                {"messages": messages}, config={"recursion_limit": 10})
             return result["messages"][-1].text
 
         chat_tasks.submit(prompt, respond)

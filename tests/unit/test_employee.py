@@ -84,7 +84,7 @@ class EmployeeServiceTests(unittest.TestCase):
         self.service = EmployeeService(self.config, self.client, self.requests)
 
     def test_returns_full_profile_using_repository_credentials(self):
-        result = self.service.get_current_user()
+        result = self.service.get_user_info()
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["data"], PROFILE)
         self.client.get_employee_detail.assert_called_once_with("demo.user", "test-token", cookies=[])
@@ -93,7 +93,59 @@ class EmployeeServiceTests(unittest.TestCase):
     def test_unconfigured_user_does_not_call_api(self):
         self.service.config = LoginConfig()
         self.assertEqual(self.service.get_current_user()["status"], "config_error")
+        self.assertEqual(self.service.get_user_info("other.user")["status"], "config_error")
         self.client.get_employee_detail.assert_not_called()
+
+    def test_named_user_uses_configured_accounts_credentials(self):
+        self.repository.save("other.user", Credentials(verified=True), "other-token")
+        profile = dict(PROFILE, uname="other.user", name2="其他员工")
+        self.client.get_employee_detail.return_value = profile
+        result = self.service.get_user_info("other.user")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"], profile)
+        self.assertIn("指定账号", result["message"])
+        self.client.get_employee_detail.assert_called_once_with("other.user", "test-token", cookies=[])
+        self.assertEqual(self.requests.username, "demo.user")
+        self.renew.assert_not_called()
+
+    def test_named_user_is_trimmed_and_response_match_ignores_case(self):
+        self.client.get_employee_detail.return_value = dict(PROFILE, uname="OTHER.USER")
+        result = self.service.get_user_info("  other.user\t")
+        self.assertEqual(result["status"], "success")
+        self.client.get_employee_detail.assert_called_once_with("other.user", "test-token", cookies=[])
+
+    def test_invalid_explicit_account_does_not_fall_back_or_start_login(self):
+        self.repository.load = Mock(wraps=self.repository.load)
+        for username in ("", " \t", ".", "..", 123):
+            with self.subTest(username=username):
+                self.assertEqual(self.service.get_user_info(username)["status"], "invalid_request")
+        self.repository.load.assert_not_called()
+        self.client.get_employee_detail.assert_not_called()
+        self.renew.assert_not_called()
+
+    def test_named_user_401_retries_same_target_with_fresh_local_credentials(self):
+        self.repository.save("other.user", Credentials(verified=True), "other-token")
+        self.client.get_employee_detail.side_effect = [OaApiError(401), dict(PROFILE, uname="other.user")]
+        result = self.service.get_user_info("other.user")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual([call.args for call in self.client.get_employee_detail.call_args_list],
+                         [("other.user", "test-token"), ("other.user", "new-token")])
+        self.renew.assert_called_once()
+        self.assertEqual(self.repository.load("demo.user").token, "new-token")
+        self.assertEqual(self.repository.load("other.user").token, "other-token")
+
+    def test_named_user_permission_denied_keeps_local_session(self):
+        self.client.get_employee_detail.side_effect = OaApiError(403)
+        result = self.service.get_user_info("other.user")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["status_code"], 403)
+        self.assertEqual(self.repository.load("demo.user").token, "test-token")
+        self.renew.assert_not_called()
+
+    def test_named_user_mismatch_does_not_return_other_profile(self):
+        result = self.service.get_user_info("other.user")
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("data", result)
 
     def test_missing_record_logs_in_and_continues_same_task(self):
         self.repository.delete("demo.user")
@@ -159,3 +211,19 @@ class EmployeeServiceTests(unittest.TestCase):
         session.employee.client.get_employee_detail.side_effect = OaApiError(401)
         self.assertEqual(session.call("user_info")["status_code"], 401)
         self.assertEqual(session.call("status")["state"], "expired")
+
+    def test_worker_passes_named_user_and_defaults_again_on_next_call(self):
+        session = LoginSession(self.config, repository=self.repository)
+        self.addCleanup(session.close)
+        executed = []
+
+        def fetch(username, token, cookies=None):
+            executed.append((threading.get_ident(), username, token))
+            return dict(PROFILE, uname=username)
+
+        session.employee.client.get_employee_detail = Mock(side_effect=fetch)
+        self.assertEqual(session.call("user_info", {"username": "other.user"})["data"]["uname"], "other.user")
+        self.assertEqual(session.call("user_info")["data"]["uname"], "demo.user")
+        self.assertEqual([call[1:] for call in executed],
+                         [("other.user", "test-token"), ("demo.user", "test-token")])
+        self.assertTrue(all(call[0] != threading.get_ident() for call in executed))

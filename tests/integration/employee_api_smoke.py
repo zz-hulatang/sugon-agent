@@ -26,12 +26,13 @@ def main():
         def do_GET(self):
             # 收集的认证数据均为本测试创建的虚构值，不输出到日志。
             seen.append((self.path, self.headers.get("token"), self.headers.get("Cookie", "")))
-            status = 200 if len(seen) in {1, 3} else 401 if len(seen) == 2 else 302
+            status = 200 if len(seen) in {1, 3, 5} else 401 if len(seen) == 2 else 302
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Location", "/unexpected-redirect")
             self.end_headers()
-            self.wfile.write(json.dumps(profile if status == 200 else {}).encode())
+            data = dict(profile, uname="other.user") if self.path.endswith("/other.user") else profile
+            self.wfile.write(json.dumps(data if status == 200 else {}).encode())
 
         def log_message(self, *args):
             pass
@@ -78,7 +79,12 @@ def main():
                     else:
                         raise AssertionError("重定向不应被自动跟随")
                     assert len(seen) == 4
-                print("真实 Playwright API 检查通过：每次从仓库加载 Cookie/Token，401 更新后原调用自动成功。")
+                    result = service.get_user_info("other.user")
+                    assert result["data"]["uname"] == "other.user"
+                    assert seen[4][0] == "/api/sap/getEmployeeDetail/other.user"
+                    assert seen[4][1] == "fresh-token" and "SESSION=fresh-session" in seen[4][2]
+                    assert repository.load("other.user") is None
+                print("真实 Playwright API 检查通过：默认及指定账号查询复用本机会话，401 更新后原调用自动成功。")
             finally:
                 request.dispose()
     finally:

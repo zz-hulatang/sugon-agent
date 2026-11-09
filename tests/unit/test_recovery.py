@@ -43,7 +43,7 @@ class RecoveryTests(unittest.TestCase):
             calls.append(token)
             if token == "old":
                 raise OaApiError(401)
-            return {"uname": "demo", "name2": "测试用户"}
+            return {"uname": username, "name2": "测试用户"}
 
         session.employee.client.get_employee_detail = Mock(side_effect=fetch)
         return session, repo, entered, verified, calls
@@ -74,6 +74,23 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(results[0]["status"], "auth_required")
         self.assertIsNone(repo.load("demo"))
         self.assertEqual(calls, ["old"])
+
+    def test_named_user_survives_manual_mfa_recovery(self):
+        session, repo, entered, verified, calls = self.create_session()
+        results = []
+        thread = threading.Thread(target=lambda: results.append(session.call("user_info", {"username": "other.user"})))
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        self.assertTrue(session.call("status")["recovering"])
+        verified.set()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results[0]["data"]["uname"], "other.user")
+        self.assertEqual(calls, ["old", "fresh"])
+        self.assertEqual([call.args[0] for call in session.employee.client.get_employee_detail.call_args_list],
+                         ["other.user", "other.user"])
+        self.assertEqual(repo.load("demo").token, "fresh")
+        self.assertIsNone(repo.load("other.user"))
 
     def test_shared_user_newer_row_is_not_deleted_by_old_401(self):
         session, repo, _, _, calls = self.create_session()

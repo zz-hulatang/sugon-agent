@@ -3,7 +3,7 @@ from typing import Any, Literal, NotRequired, TypedDict
 
 
 class EmployeeResult(TypedDict):
-    status: Literal["success", "auth_required", "config_error", "error"]
+    status: Literal["success", "auth_required", "config_error", "invalid_request", "error"]
     message: str
     data: NotRequired[dict[str, Any]]
     status_code: NotRequired[int]

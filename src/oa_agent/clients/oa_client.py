@@ -24,7 +24,7 @@ class OaClient:
             return self._get_employee_detail(request, username, token)
 
     def _get_employee_detail(self, request, username: str, token: str) -> dict:
-        """获取配置账号的员工详情；禁止重定向，避免认证头被带往其他地址。"""
+        """获取指定查询账号的员工详情；禁止重定向，避免认证头被带往其他地址。"""
         if not username.strip() or username in {".", ".."}:
             raise OaApiError()
         response = None

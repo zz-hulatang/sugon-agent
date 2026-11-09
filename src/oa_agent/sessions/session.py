@@ -64,7 +64,7 @@ class LoginSession:
         business_actions = {"user_info", "attendance_query", "attendance_submit"}
         if action not in {"open", "collect", "status", "clear", "credentials", *business_actions}:
             raise ValueError("不支持的会话操作")
-        if payload is not None and (not isinstance(payload, dict) or action not in {"attendance_query", "attendance_submit"}):
+        if payload is not None and (not isinstance(payload, dict) or action not in business_actions):
             raise ValueError("不支持的会话参数")
         self._start()
         # 调用者等待 Future，浏览器操作始终在同一线程执行，保持 Playwright 线程约束。
@@ -167,7 +167,7 @@ class LoginSession:
                     result = self.store.snapshot()
                 elif action == "user_info":
                     # HTTP 调用同样在浏览器所属线程执行，避免跨线程使用 Playwright。
-                    result = self.employee.get_current_user()
+                    result = self.employee.get_user_info(**payload)
                 elif action == "attendance_query":
                     result = self.attendance.query(**payload)
                 elif action == "attendance_submit":

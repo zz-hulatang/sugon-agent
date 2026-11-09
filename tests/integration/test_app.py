@@ -62,15 +62,35 @@ class AppTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             tool.invoke({"action": "collect"})
 
-    def test_employee_tool_has_no_account_or_credential_parameters(self):
+    def test_employee_tool_defaults_to_configured_account_without_credentials(self):
         from unittest.mock import Mock
         from oa_agent.tools.employee import make_employee_tool
 
         session = Mock()
         session.call.return_value = {"status": "auth_required", "status_code": 401, "message": "请重新登录"}
         tool = make_employee_tool(session)
-        self.assertEqual(tool.args_schema.model_json_schema()["properties"], {})
+        schema = tool.args_schema.model_json_schema()
+        self.assertEqual(set(schema["properties"]), {"username"})
+        self.assertNotIn("username", schema.get("required", []))
         self.assertEqual(tool.invoke({})["status_code"], 401)
+        session.call.assert_called_once_with("user_info")
+
+    def test_employee_tool_passes_named_account(self):
+        from unittest.mock import Mock
+        from oa_agent.tools.employee import make_employee_tool
+
+        session = Mock()
+        session.call.return_value = {"status": "success", "data": {"uname": "other.user"}}
+        tool = make_employee_tool(session)
+        self.assertEqual(tool.invoke({"username": "other.user"})["data"]["uname"], "other.user")
+        session.call.assert_called_once_with("user_info", {"username": "other.user"})
+
+    def test_employee_tool_null_account_uses_default(self):
+        from unittest.mock import Mock
+        from oa_agent.tools.employee import make_employee_tool
+
+        session = Mock()
+        make_employee_tool(session).invoke({"username": None})
         session.call.assert_called_once_with("user_info")
 
     def test_background_task_survives_app_rerun_and_delivers_once(self):

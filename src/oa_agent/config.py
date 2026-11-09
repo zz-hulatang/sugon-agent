@@ -23,7 +23,7 @@ class LoginConfig:
     idle_seconds: int = 1800
     browser_channel: str = ""
     user_info_url: str = "https://msp.soa.com.cn/api/sap/getLoginUser"
-    # 凭据只由本机后端使用，不能放入工具参数、模型提示词或配置 repr。
+    # 登录凭据只由本机后端读取，不注入工具参数、模型提示词或配置 repr；查询账号可由用户另行指定。
     username: str = field(default="", repr=False)
     password: str = field(default="", repr=False)
     login_url: str = "https://soa.com.cn/sioLogin/"

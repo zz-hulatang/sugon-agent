@@ -31,3 +31,12 @@ class ConfigTests(unittest.TestCase):
 
     def test_missing_model_config_is_not_ready(self):
         self.assertFalse(ModelConfig(api_key="dummy-key").configured)
+
+    def test_reasoning_summary_environment_switch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text("OPENAI_REASONING_SUMMARY=true\n")
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertTrue(load_settings(env).model.reasoning_summary)
+            with patch.dict(os.environ, {"OPENAI_REASONING_SUMMARY": "false"}, clear=True):
+                self.assertFalse(load_settings(env).model.reasoning_summary)

@@ -114,6 +114,7 @@ class ModelConfig:
     api_key: str = ""
     model: str = ""
     base_url: str = ""
+    reasoning_summary: bool = False
 
     @property
     def configured(self) -> bool:
@@ -167,5 +168,6 @@ def load_settings(env_file: Path | None = None) -> AppSettings:
             api_key=os.getenv("OPENAI_API_KEY", ""),
             model=os.getenv("OPENAI_MODEL", ""),
             base_url=os.getenv("OPENAI_BASE_URL", ""),
+            reasoning_summary=os.getenv("OPENAI_REASONING_SUMMARY", "").strip().lower() in {"1", "true", "yes"},
         ),
     )

@@ -4,11 +4,15 @@
 """
 from pathlib import Path
 from datetime import datetime
+from dataclasses import replace
+from inspect import signature
 from zoneinfo import ZoneInfo
+import time
 
 import streamlit as st
 
 from oa_agent.agents.oa_agent import build_agent
+from oa_agent.agents.streaming import stream_agent_response
 from oa_agent.config import load_settings
 from oa_agent.history.manager import ConversationHistory
 from oa_agent.history.mysql_repository import MySQLHistoryRepository
@@ -144,17 +148,58 @@ def render_history_panel():
 with st.sidebar:
     render_login_panel()
     render_history_panel()
+    st.divider()
+    st.subheader("思考展示")
+    st.toggle("请求模型推理摘要", value=settings.model.reasoning_summary, key="request_reasoning_summary",
+              help="需要模型服务支持。开启后会请求推理摘要；若接口不支持，请关闭。")
 
-@st.fragment(run_every=1)
+
+def render_execution(progress):
+    """思考文本随流出现，工具记录穿插其中，完成后自动收起。"""
+    elapsed = (progress.finished_at or time.monotonic()) - progress.started_at
+    running = progress.state == "running"
+    label = "思考中" if running else "思考已中断" if progress.state == "error" else "已思考"
+    # 新版 Streamlit 提供轻量的行内样式；旧版仍使用相同的展开/收起行为。
+    style = {"type": "compact"} if "type" in signature(st.status).parameters else {}
+    status = st.status(f"{label} · {elapsed:.1f} 秒", state=progress.state, expanded=running, **style)
+    with status.container():
+        if progress.summary:
+            st.caption("模型提供的推理摘要与操作说明")
+        steps = {step.key: step for step in progress.steps}
+        for entry in progress.thinking:
+            if entry.kind in {"summary", "commentary"}:
+                st.markdown(entry.text)
+            elif entry.key in steps:
+                step = steps[entry.key]
+                icon = {"running": "⏳", "complete": "✓", "error": "⚠"}[step.state]
+                duration = (step.finished_at or time.monotonic()) - step.started_at
+                st.caption(f"{icon} {step.text} · {duration:.1f} 秒")
+        if not progress.thinking:
+            st.caption("正在等待模型输出…" if running else "本轮未收到模型推理摘要。")
+        elif not progress.summary and not running and st.session_state.request_reasoning_summary:
+            st.caption("本轮未收到模型推理摘要。")
+
+
+@st.fragment(run_every=0.3)
 def render_conversation():
     # 页面重跑只读取进度；原 Agent 调用和业务任务保留在后台执行。
     completed = chat_tasks.poll()
     history.retry()
     if completed or history.revision != st.session_state.history_view_revision:
         st.rerun()
-    for message in chat_tasks.messages:
+    messages = chat_tasks.messages
+    progress_by_index = {progress.user_index + 1: progress for progress in chat_tasks.progress()}
+    for index, message in enumerate(messages):
         with st.chat_message(message["role"]):
+            if index in progress_by_index and message["role"] == "assistant":
+                render_execution(progress_by_index[index])
             st.markdown(message["content"])
+    pending = progress_by_index.get(len(messages))
+    if pending:
+        with st.chat_message("assistant"):
+            render_execution(pending)
+            if pending.answer:
+                st.markdown(pending.answer)
     if chat_tasks.busy:
         st.info("后台任务正在执行，可以切换查看或新建会话，完成后可发送新问题。若需要验证码，请在浏览器完成验证。")
     elif chat_tasks.messages and chat_tasks.messages[-1]["role"] == "user":
@@ -165,12 +210,12 @@ def render_conversation():
             st.info("请先在 .env 配置 OPENAI_API_KEY 和 OPENAI_MODEL；侧栏登录功能无需模型即可使用。")
             return
 
-        def respond(messages, tools=[login_tool, employee_tool, *attendance_tools], model_config=settings.model):
-            result = build_agent(tools, model_config).invoke(
-                {"messages": messages}, config={"recursion_limit": 10})
-            return result["messages"][-1].text
+        def respond(messages, emit, tools=[login_tool, employee_tool, *attendance_tools],
+                    model_config=replace(settings.model, reasoning_summary=st.session_state.request_reasoning_summary),
+                    login_session=session):
+            return stream_agent_response(build_agent(tools, model_config), messages, emit, login_session)
 
-        chat_tasks.submit(prompt, respond)
+        chat_tasks.submit(prompt, respond, streaming=True)
         st.rerun()
 
 

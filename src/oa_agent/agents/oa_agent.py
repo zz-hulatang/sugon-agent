@@ -16,6 +16,8 @@ def build_agent(tools: list, config: ModelConfig):
         base_url=config.base_url or None,
         timeout=40,
         max_retries=1,
+        **({"use_responses_api": True, "output_version": "responses/v1",
+            "reasoning": {"summary": "auto"}} if config.reasoning_summary else {}),
     )
     # 只注册明确支持的能力；模型通过工具接收业务结果，不直接接触浏览器或凭据仓库。
     return create_agent(model=model, tools=tools, system_prompt=build_system_prompt())

@@ -51,17 +51,22 @@ class RecoveryTests(unittest.TestCase):
     def test_manual_mfa_completion_resumes_original_future(self):
         session, repo, entered, verified, calls = self.create_session()
         results = []
+        events = []
         thread = threading.Thread(target=lambda: results.append(session.call("user_info")))
-        thread.start()
-        self.assertTrue(entered.wait(2))
-        self.assertTrue(session.call("status")["recovering"])
-        self.assertTrue(thread.is_alive())
-        verified.set()  # 模拟用户在浏览器中完成 MFA，未再次调用 user_info。
-        thread.join(timeout=3)
+        with session.progress_listener(events.append):
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            self.assertTrue(session.call("status")["recovering"])
+            self.assertTrue(thread.is_alive())
+            verified.set()  # 模拟用户在浏览器中完成 MFA，未再次调用 user_info。
+            thread.join(timeout=3)
         self.assertFalse(thread.is_alive())
         self.assertEqual(results[0]["status"], "success")
         self.assertEqual(calls, ["old", "fresh"])
         self.assertEqual(repo.load("demo").token, "fresh")
+        self.assertTrue(any("MFA" in event.text for event in events))
+        self.assertEqual(events[-1].state, "complete")
+        self.assertEqual(session._progress_listeners, [])
 
     def test_user_clear_cancels_pending_task(self):
         session, repo, entered, _, calls = self.create_session()

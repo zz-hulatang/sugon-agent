@@ -23,6 +23,17 @@ class AgentTests(unittest.TestCase):
             build_agent([], ModelConfig())
         model.assert_not_called()
 
+    def test_reasoning_summary_is_opt_in_for_responses_compatible_services(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), patch("oa_agent.agents.oa_agent.ChatOpenAI") as model, patch("oa_agent.agents.oa_agent.create_agent"):
+                build_agent([], ModelConfig(api_key="dummy", model="test", reasoning_summary=enabled))
+                if enabled:
+                    self.assertTrue(model.call_args.kwargs["use_responses_api"])
+                    self.assertEqual(model.call_args.kwargs["reasoning"], {"summary": "auto"})
+                else:
+                    self.assertNotIn("reasoning", model.call_args.kwargs)
+                    self.assertNotIn("use_responses_api", model.call_args.kwargs)
+
 
 class PromptDateTests(unittest.TestCase):
     def test_previous_and_next_month_cross_year_boundaries(self):

@@ -7,12 +7,15 @@ import hashlib
 import json
 from copy import deepcopy
 from concurrent.futures import Future
+from contextlib import contextmanager
+from uuid import uuid4
 
 from oa_agent.clients.browser import BrowserClient
 from oa_agent.clients.oa_client import OaClient
 from oa_agent.clients.attendance_client import AttendanceClient
 from oa_agent.config import LoginConfig, MySQLConfig
 from oa_agent.schemas.auth import Credentials
+from oa_agent.schemas.progress import ProgressEvent
 from oa_agent.services.auth import AuthService
 from oa_agent.services.auto_login import AutoLoginService
 from oa_agent.services.employee import EmployeeService
@@ -49,7 +52,30 @@ class LoginSession:
         self._lock = threading.Lock()
         self._thread = None
         self._last_check = 0.0
+        self._progress_lock = threading.Lock()
+        self._progress_listeners = []
         atexit.register(self.close)
+
+    @contextmanager
+    def progress_listener(self, callback):
+        """为当前任务订阅固定的登录进度提示，跨浏览器线程传递展示事件。"""
+        with self._progress_lock:
+            self._progress_listeners.append(callback)
+        try:
+            yield
+        finally:
+            with self._progress_lock:
+                self._progress_listeners.remove(callback)
+
+    def _emit_progress(self, key, text, state="running"):
+        with self._progress_lock:
+            callbacks = list(self._progress_listeners)
+        for callback in callbacks:
+            try:
+                callback(ProgressEvent("step", key, text, state, category="auth"))
+            except Exception:
+                # 展示端失败不影响认证和原业务请求，也不触发重试。
+                pass
 
     def _start(self):
         # Streamlit 重跑或工具调用可能来自不同线程，只允许启动一个工作线程。
@@ -230,6 +256,9 @@ class LoginSession:
         """在原工具调用内恢复登录；等待验证码期间仍处理状态、关闭等控制命令。"""
         self._clear()
         self._recovering = True
+        progress_key = "login-" + uuid4().hex
+        self._emit_progress(progress_key, "正在恢复 OA 登录")
+        last_progress = None
         try:
             self.store.state = "waiting_login"
             self.browser.open(self.auth.on_request, self.auth.on_response)
@@ -240,7 +269,16 @@ class LoginSession:
                     self._login_tick()
                     last_check = time.monotonic()
                 if self.store.state == "verified":
+                    self._emit_progress(progress_key, "OA 登录已恢复，继续原任务", "complete")
                     return
+                progress_state = self.auto_login.state
+                if progress_state != last_progress:
+                    text = {
+                        "needs_verification": "等待短信、扫码或 MFA 验证，请在浏览器完成",
+                        "submitted": "已提交登录，等待 OA 验证",
+                    }.get(progress_state, "等待 OA 登录，请在浏览器完成验证")
+                    self._emit_progress(progress_key, text)
+                    last_progress = progress_state
                 if self.auto_login.state == "failed":
                     raise LoginRecoveryError("登录失败，停止自动重试")
                 # Future 对应的原业务任务一直保留，成功后由执行器继续该请求。
@@ -274,11 +312,13 @@ class LoginSession:
                     raise LoginRecoveryError("登录窗口已关闭")
             raise LoginRecoveryError("登录等待超时")
         except SessionRepositoryError as error:
+            self._emit_progress(progress_key, "登录恢复失败，请检查数据库配置或权限", "error")
             self._persistence_error = True
             self._persistence_message = error.public_message
             self.store.reset("error")
             raise
         except Exception:
+            self._emit_progress(progress_key, "登录恢复未完成或已取消，请查看回复", "error")
             raise LoginRecoveryError("登录恢复未完成") from None
         finally:
             self._recovering = False

@@ -4,6 +4,12 @@ from pathlib import Path
 import unittest
 
 
+def reply_stream(text):
+    from langchain_core.messages import AIMessage
+
+    return [("updates", {"model": {"messages": [AIMessage(content=text)]}})]
+
+
 @unittest.skipUnless(importlib.util.find_spec("streamlit") and importlib.util.find_spec("langchain"), "未安装应用依赖")
 class AppTests(unittest.TestCase):
     def setUp(self):
@@ -96,7 +102,6 @@ class AppTests(unittest.TestCase):
     def test_background_task_survives_app_rerun_and_delivers_once(self):
         import threading
         import time
-        from types import SimpleNamespace
         from unittest.mock import patch, Mock
         from streamlit.testing.v1 import AppTest
         from oa_agent.config import AppSettings, LoginConfig, ModelConfig
@@ -104,7 +109,7 @@ class AppTests(unittest.TestCase):
         verified = threading.Event()
         config = AppSettings(LoginConfig(), ModelConfig(api_key="dummy", model="test"))
         agent = Mock()
-        agent.invoke.side_effect = lambda *args, **kwargs: (verified.wait(2) or True) and {"messages": [SimpleNamespace(text="原任务完成")]}
+        agent.stream.side_effect = lambda *args, **kwargs: (verified.wait(2) or True) and reply_stream("原任务完成")
         root = Path(__file__).resolve().parents[2]
         with patch("oa_agent.config.load_settings", return_value=config), patch("oa_agent.agents.oa_agent.build_agent", return_value=agent):
             app = AppTest.from_file(str(root / "apps" / "streamlit_app.py")).run(timeout=30)
@@ -123,10 +128,10 @@ class AppTests(unittest.TestCase):
             self.assertEqual(len(app.exception), 0)
             self.assertEqual(len(runner.messages), 2)
             self.assertEqual(runner.messages[-1]["content"], "原任务完成")
-            agent.invoke.assert_called_once()
+            agent.stream.assert_called_once()
+            agent.invoke.assert_not_called()
 
     def history_app(self, agent=None):
-        from types import SimpleNamespace
         from unittest.mock import Mock, patch
         from streamlit.testing.v1 import AppTest
         from oa_agent.config import AppSettings, LoginConfig, ModelConfig
@@ -134,9 +139,8 @@ class AppTests(unittest.TestCase):
         config = AppSettings(LoginConfig(username="alice", password="dummy"),
                              ModelConfig(api_key="dummy", model="test"))
         agent = agent if agent is not None else Mock()
-        if agent.invoke.side_effect is None:
-            agent.invoke.side_effect = lambda data, **kwargs: {
-                "messages": [SimpleNamespace(text="回复：" + data["messages"][-1]["content"])]}
+        if agent.stream.side_effect is None:
+            agent.stream.side_effect = lambda data, **kwargs: reply_stream("回复：" + data["messages"][-1]["content"])
         for patcher in (patch("oa_agent.config.load_settings", return_value=config),
                         patch("oa_agent.agents.oa_agent.build_agent", return_value=agent)):
             patcher.start()
@@ -167,7 +171,7 @@ class AppTests(unittest.TestCase):
         app.sidebar.button(key=f"open_{first_id}").click().run(timeout=30)
         app.chat_input[0].set_value("继续 A").run(timeout=30)
         self.complete_chat(app)
-        self.assertEqual([message["content"] for message in agent.invoke.call_args.args[0]["messages"]],
+        self.assertEqual([message["content"] for message in agent.stream.call_args.args[0]["messages"]],
                          ["会话 A", "回复：会话 A", "继续 A"])
         restarted, _ = self.history_app()
         self.assertEqual(restarted.session_state["chat_tasks"].history.current_id, first_id)
@@ -184,7 +188,6 @@ class AppTests(unittest.TestCase):
 
     def test_history_switch_during_task_keeps_reply_in_original_and_disables_sending(self):
         import threading
-        from types import SimpleNamespace
         from unittest.mock import Mock
 
         started, release = threading.Event(), threading.Event()
@@ -194,9 +197,9 @@ class AppTests(unittest.TestCase):
         def respond(*args, **kwargs):
             started.set()
             release.wait(10)
-            return {"messages": [SimpleNamespace(text="后台完成")]}
+            return reply_stream("后台完成")
 
-        agent.invoke.side_effect = respond
+        agent.stream.side_effect = respond
         app, _ = self.history_app(agent)
         app.chat_input[0].set_value("执行 A").run(timeout=30)
         self.assertTrue(started.wait(2))
@@ -216,7 +219,7 @@ class AppTests(unittest.TestCase):
         app.sidebar.button(key=f"open_{first_id}").click().run(timeout=30)
         self.assertEqual(runner.messages[-1]["content"], "后台完成")
         self.assertFalse(app.sidebar.button(key=f"delete_{first_id}").disabled)
-        agent.invoke.assert_called_once()
+        agent.stream.assert_called_once()
 
     def test_unfinished_history_warns_without_starting_agent(self):
         from oa_agent.history.repository import ConversationSummary, HistoryMessage
@@ -225,7 +228,101 @@ class AppTests(unittest.TestCase):
         self.history_repository.append("alice", "unfinished", [HistoryMessage("prompt", "user", "待处理", 1)])
         app, agent = self.history_app()
         self.assertTrue(any("上次任务未完成" in warning.value for warning in app.warning))
+        agent.stream.assert_not_called()
+
+    def test_live_answer_and_summary_remain_visible_after_completion_and_switching(self):
+        import threading
+        from unittest.mock import Mock
+        from langchain_core.messages import AIMessageChunk, ToolMessage
+
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        agent = Mock()
+
+        def chunks(*args, **kwargs):
+            callback = kwargs["config"]["callbacks"][0]
+            callback.on_tool_start({"name": "get_user_info"}, '{"username":"other.user","token":"private-input"}', run_id="tool1")
+            callback.on_tool_end(ToolMessage(content='{"status":"success","data":"private-result"}',
+                                             tool_call_id="tool1"), run_id="tool1")
+            yield "messages", (AIMessageChunk(content=[{"type": "reasoning", "summary": [
+                {"type": "summary_text", "text": "接口提供的推理摘要"}]}]), {})
+            yield "messages", (AIMessageChunk(content="正在生成的回答"), {})
+            started.set()
+            release.wait(10)
+            yield from reply_stream("最终回答")
+
+        agent.stream.side_effect = chunks
+        app, _ = self.history_app(agent)
+        app.chat_input[0].set_value("查询我的部门").run(timeout=30)
+        self.assertTrue(started.wait(2))
+        app.run(timeout=30)
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any(item.value == "正在生成的回答" for item in app.markdown))
+        thinking = app.get("status")[0]
+        self.assertTrue(thinking.label.startswith("思考中 ·"))
+        self.assertTrue(thinking.proto.expanded)
+        self.assertTrue(any(item.value == "接口提供的推理摘要" for item in app.markdown))
+        self.assertTrue(any("查询用户信息" in item.value for item in app.caption))
+        self.assertEqual(len(app.metric), 0)
+        self.assertFalse(any("第 1 段" in item.value or "状态变化" in item.value for item in app.caption))
+        self.assertFalse(any("private-" in item.value for item in app.markdown))
+        first_id = app.session_state["chat_tasks"].history.current_id
+        app.sidebar.button(key="new_conversation").click().run(timeout=30)
+        self.assertFalse(any(item.value == "正在生成的回答" for item in app.markdown))
+        self.assertEqual(len(app.get("status")), 0)
+        release.set()
+        self.complete_chat(app)
+        app.sidebar.button(key=f"open_{first_id}").click().run(timeout=30)
+        self.assertTrue(any(item.value == "最终回答" for item in app.markdown))
+        self.assertTrue(any(item.value == "接口提供的推理摘要" for item in app.markdown))
+        self.assertTrue(app.get("status")[0].label.startswith("已思考 ·"))
+        self.assertFalse(app.get("status")[0].proto.expanded)
+        self.assertEqual(len(app.get("status")), 1)
+        agent.stream.assert_called_once()
+
+    def test_stream_failure_shows_error_without_retrying_or_saving_partial_answer(self):
+        from unittest.mock import Mock
+        from langchain_core.messages import AIMessageChunk
+
+        agent = Mock()
+
+        def chunks(*args, **kwargs):
+            yield "messages", (AIMessageChunk(content="不完整回答"), {})
+            raise RuntimeError("private-token-in-exception")
+
+        agent.stream.side_effect = chunks
+        app, _ = self.history_app(agent)
+        app.chat_input[0].set_value("查询").run(timeout=30)
+        self.complete_chat(app)
+        runner = app.session_state["chat_tasks"]
+        self.assertEqual(runner.progress()[0].state, "error")
+        self.assertIn("任务处理失败", runner.messages[-1]["content"])
+        self.assertFalse(any("private-token" in item.value or "不完整回答" in item.value for item in app.markdown))
+        self.assertEqual(len(app.get("status")), 1)
+        self.assertTrue(app.get("status")[0].label.startswith("思考已中断 ·"))
+        self.assertFalse(app.get("status")[0].proto.expanded)
+        self.assertEqual(app.expander, [])
+        agent.stream.assert_called_once()
         agent.invoke.assert_not_called()
+
+    def test_sidebar_summary_switch_is_applied_to_next_model_call(self):
+        from unittest.mock import patch
+
+        app, _ = self.history_app()
+        app.sidebar.toggle(key="request_reasoning_summary").set_value(True).run(timeout=30)
+        with patch("oa_agent.agents.oa_agent.build_agent", return_value=self._fake_agent()) as build:
+            app.chat_input[0].set_value("查询").run(timeout=30)
+            self.complete_chat(app)
+            self.assertTrue(build.call_args.args[1].reasoning_summary)
+        self.assertTrue(any("本轮未收到模型推理摘要" in item.value for item in app.caption))
+
+    @staticmethod
+    def _fake_agent():
+        from unittest.mock import Mock
+
+        agent = Mock()
+        agent.stream.side_effect = lambda *args, **kwargs: reply_stream("回答")
+        return agent
 
 
 if __name__ == "__main__":
